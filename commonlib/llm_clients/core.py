@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict
 import json
 from pathlib import Path
@@ -20,6 +21,10 @@ __all__ = [
 
 class QuotaExceededError(RuntimeError):
     """Raised when an upstream LLM rejects a request due to quota limits."""
+
+
+_TRANSIENT_STATUS = {500, 502, 503, 504}
+_TRANSIENT_BACKOFF = (15, 45, 90)  # seconds between retries; ~2.5 min in total
 
 
 def _resolve_timeout() -> float:
@@ -113,20 +118,34 @@ class GeminiLLMClient:
                     print(f"[GeminiLLMClient] wrote debug payload to {debug_path}")
                 except Exception as exc:
                     print(f"[GeminiLLMClient] failed to write debug payload: {exc}")
-            try:
-                response = requests.post(
-                    self.endpoint,
-                    params=params,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-                print(f"[GeminiLLMClient] connection error with limit={limit}: {exc}")
-                last_exc = exc
+            # Gemini answers 503 "high demand" for minutes at a time. One failed call used to kill
+            # the whole run: the Seta National Day post (2026-09-30) was never generated. Retry
+            # transient failures with backoff before giving up.
+            response = None
+            conn_exc: Exception | None = None
+            for wait in (*_TRANSIENT_BACKOFF, None):
+                conn_exc = None
+                try:
+                    response = requests.post(
+                        self.endpoint,
+                        params=params,
+                        json=payload,
+                        timeout=self.timeout,
+                    )
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                    print(f"[GeminiLLMClient] connection error with limit={limit}: {exc}")
+                    conn_exc = exc
+                except requests.RequestException as exc:  # pragma: no cover - other network failures
+                    print(f"[GeminiLLMClient] request failed to send: {exc}")
+                    raise exc
+                transient = conn_exc is not None or response.status_code in _TRANSIENT_STATUS
+                if not transient or wait is None:
+                    break
+                print(f"[GeminiLLMClient] transient failure, retrying in {wait}s")
+                time.sleep(wait)
+            if conn_exc is not None:
+                last_exc = conn_exc
                 continue
-            except requests.RequestException as exc:  # pragma: no cover - other network failures
-                print(f"[GeminiLLMClient] request failed to send: {exc}")
-                raise exc
 
             if response.status_code == 429:
                 raise QuotaExceededError("Gemini quota exceeded")
