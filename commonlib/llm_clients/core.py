@@ -78,6 +78,28 @@ class GeminiLLMClient:
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         )
 
+    def _openrouter_fallback(self, prompt: str, temperature: float | None) -> str:
+        payload: Dict[str, Any] = {
+            "model": f"google/{self.model_name}",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 8192,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        response = requests.post(
+            OpenRouterLLMClient.BASE_URL,
+            headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+            json=payload,
+            timeout=self.timeout,
+        )
+        if not response.ok:
+            raise requests.HTTPError(
+                f"Gemini 402 and OpenRouter fallback failed ({response.status_code}): {response.text[:300]}",
+                response=response,
+            )
+        choices = response.json().get("choices") or []
+        return (choices[0].get("message") or {}).get("content") or "" if choices else ""
+
     def complete(self, prompt: str, **kwargs: Any) -> str:
         temperature = kwargs.get("temperature")
         attempt_limits = [None, 6000]
@@ -149,6 +171,12 @@ class GeminiLLMClient:
 
             if response.status_code == 429:
                 raise QuotaExceededError("Gemini quota exceeded")
+
+            # 402 = Gemini prepaid credits depleted (LinkedIn posts stopped 2026-10-02). Same model,
+            # billed to OpenRouter, so a missed top-up no longer costs a day's post.
+            if response.status_code == 402 and os.getenv("OPENROUTER_API_KEY"):
+                print("[GeminiLLMClient] credits depleted (402) - falling back to OpenRouter")
+                return self._openrouter_fallback(working_prompt, temperature)
 
             if not response.ok:
                 try:
