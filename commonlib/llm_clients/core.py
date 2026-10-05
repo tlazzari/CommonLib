@@ -100,6 +100,32 @@ class GeminiLLMClient:
         choices = response.json().get("choices") or []
         return (choices[0].get("message") or {}).get("content") or "" if choices else ""
 
+    def _alibaba_fallback(self, prompt: str, temperature: float | None) -> str:
+        """Qwen3.8-Max on the Alibaba Token Plan (Singapore endpoint) - last resort when Gemini
+        credits are gone and OpenRouter is missing or failing. Thinking off: non-streaming requests
+        are closed by Alibaba at 60s."""
+        payload: Dict[str, Any] = {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 8192,
+            "enable_thinking": False,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        response = requests.post(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.environ['ALIBABA_TOKEN_PLAN_KEY']}"},
+            json=payload,
+            timeout=min(self.timeout, 58),
+        )
+        if not response.ok:
+            raise requests.HTTPError(
+                f"Gemini 402 and Alibaba fallback failed ({response.status_code}): {response.text[:300]}",
+                response=response,
+            )
+        choices = response.json().get("choices") or []
+        return (choices[0].get("message") or {}).get("content") or "" if choices else ""
+
     def complete(self, prompt: str, **kwargs: Any) -> str:
         temperature = kwargs.get("temperature")
         attempt_limits = [None, 6000]
@@ -176,7 +202,16 @@ class GeminiLLMClient:
             # billed to OpenRouter, so a missed top-up no longer costs a day's post.
             if response.status_code == 402 and os.getenv("OPENROUTER_API_KEY"):
                 print("[GeminiLLMClient] credits depleted (402) - falling back to OpenRouter")
-                return self._openrouter_fallback(working_prompt, temperature)
+                try:
+                    return self._openrouter_fallback(working_prompt, temperature)
+                except Exception as exc:
+                    if not os.getenv("ALIBABA_TOKEN_PLAN_KEY"):
+                        raise
+                    print(f"[GeminiLLMClient] OpenRouter fallback failed ({exc}) - trying Alibaba Qwen")
+                    return self._alibaba_fallback(working_prompt, temperature)
+            if response.status_code == 402 and os.getenv("ALIBABA_TOKEN_PLAN_KEY"):
+                print("[GeminiLLMClient] credits depleted (402) - falling back to Alibaba Qwen")
+                return self._alibaba_fallback(working_prompt, temperature)
 
             if not response.ok:
                 try:
